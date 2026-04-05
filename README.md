@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # 🛍️ ShopEmoji — Simple E-Commerce Web App
 
 A full-stack e-commerce demo built on a **3-tier architecture**:
@@ -257,3 +258,7 @@ git push -u origin master
 
 > Make sure `backend/.env` does **not** appear in `git status` before pushing.
 > Run `git status` and verify only source files are listed.
+=======
+# devops_ecomm
+devops Implementation of the webapp for practice
+>>>>>>> 1c0231a5ffb280abe4333a64a502eaafacf5afd7
