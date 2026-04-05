@@ -1,0 +1,9 @@
+﻿{
+    "subject":  "repo:rajanktest1/devops_ecomm:ref:refs/heads/main",
+    "audiences":  [
+                      "api://AzureADTokenExchange"
+                  ],
+    "issuer":  "https://token.actions.githubusercontent.com",
+    "name":  "github-actions-main",
+    "description":  "GitHub Actions OIDC for main branch"
+}

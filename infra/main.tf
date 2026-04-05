@@ -301,14 +301,11 @@ resource "azurerm_windows_virtual_machine" "ecomm" {
 
 # -----------------------------------------------------------------------------
 # VM Custom Script Extension — one-time bootstrap
-# Runs setup-vm.ps1 from the public GitHub raw URL on first boot.
-# Update REPO_RAW_URL to match your GitHub repository.
+# setup-vm.ps1 is uploaded to blob storage by the CI/CD pipeline before
+# terraform apply, and its SAS URL is passed via var.setup_script_url.
+# Using protected_settings keeps the SAS token out of Azure activity logs.
 # -----------------------------------------------------------------------------
 locals {
-  # Replace with your actual GitHub raw URL after pushing to GitHub:
-  # https://raw.githubusercontent.com/<org>/<repo>/main/scripts/setup-vm.ps1
-  setup_script_url = "https://raw.githubusercontent.com/REPLACE_ORG/REPLACE_REPO/main/scripts/setup-vm.ps1"
-
   common_tags = {
     project     = "ecomm"
     environment = var.environment
@@ -324,13 +321,14 @@ resource "azurerm_virtual_machine_extension" "setup" {
   type_handler_version = "1.10"
 
   settings = jsonencode({
-    fileUris = [local.setup_script_url]
-    commandToExecute = join(" ", [
-      "powershell",
-      "-ExecutionPolicy Bypass",
-      "-File setup-vm.ps1",
-      "-KeyVaultName ${azurerm_key_vault.ecomm.name}",
-    ])
+    commandToExecute = "powershell -ExecutionPolicy Bypass -File setup-vm.ps1 -KeyVaultName ${azurerm_key_vault.ecomm.name}"
+  })
+
+  # fileUris in protected_settings so the SAS token is never written to
+  # Azure portal activity logs or Terraform plan output.
+  # SECURITY: SAS URL contains a time-limited read-only token
+  protected_settings = jsonencode({
+    fileUris = [var.setup_script_url]
   })
 
   tags       = local.common_tags

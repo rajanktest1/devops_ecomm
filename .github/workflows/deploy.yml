@@ -140,33 +140,73 @@ jobs:
             -backend-config="container_name=tfstate" \
             -backend-config="key=ecomm.terraform.tfstate"
 
+      - name: Upload setup-vm.ps1 to blob storage and generate SAS URL
+        id: upload_script
+        run: |
+          ACCOUNT_KEY=$(az storage account keys list \
+            --account-name "${{ secrets.TF_BACKEND_SA }}" \
+            --resource-group rg-tfstate \
+            --query '[0].value' -o tsv)
+
+          az storage container create \
+            --account-name "${{ secrets.TF_BACKEND_SA }}" \
+            --container-name scripts \
+            --account-key "$ACCOUNT_KEY" \
+            --output none
+
+          az storage blob upload \
+            --account-name "${{ secrets.TF_BACKEND_SA }}" \
+            --container-name scripts \
+            --name setup-vm.ps1 \
+            --file scripts/setup-vm.ps1 \
+            --account-key "$ACCOUNT_KEY" \
+            --overwrite \
+            --output none
+
+          EXPIRY=$(date -u -d '+1 year' '+%Y-%m-%dT%H:%MZ')
+          SAS_URL=$(az storage blob generate-sas \
+            --account-name "${{ secrets.TF_BACKEND_SA }}" \
+            --container-name scripts \
+            --name setup-vm.ps1 \
+            --permissions r \
+            --expiry "$EXPIRY" \
+            --account-key "$ACCOUNT_KEY" \
+            --full-uri \
+            --output tsv)
+
+          # SECURITY: mask the SAS URL so the token never appears in job logs
+          echo "::add-mask::$SAS_URL"
+          echo "sas_url=$SAS_URL" >> "$GITHUB_OUTPUT"
+
       - name: Terraform plan
         working-directory: ${{ env.TF_WORKING_DIR }}
         env:
           # SECURITY: sensitive Terraform variables injected from GitHub Secrets, never logged
-          TF_VAR_subscription_id:    ${{ secrets.TF_VAR_subscription_id }}
-          TF_VAR_tenant_id:          ${{ secrets.TF_VAR_tenant_id }}
-          TF_VAR_vm_admin_password:  ${{ secrets.VM_ADMIN_PASSWORD }}   # SECURITY: VM credential
-          TF_VAR_mysql_root_password: ${{ secrets.MYSQL_ROOT_PASSWORD }} # SECURITY: DB root credential
-          TF_VAR_db_password:        ${{ secrets.DB_PASSWORD }}          # SECURITY: app DB credential
-          TF_VAR_vm_ssh_public_key:  ${{ secrets.VM_SSH_PUBLIC_KEY }}    # SECURITY: deploy key
+          TF_VAR_subscription_id:       ${{ secrets.TF_VAR_subscription_id }}
+          TF_VAR_tenant_id:             ${{ secrets.TF_VAR_tenant_id }}
+          TF_VAR_vm_admin_password:     ${{ secrets.VM_ADMIN_PASSWORD }}    # SECURITY: VM credential
+          TF_VAR_mysql_root_password:   ${{ secrets.MYSQL_ROOT_PASSWORD }}  # SECURITY: DB root credential
+          TF_VAR_db_password:           ${{ secrets.DB_PASSWORD }}           # SECURITY: app DB credential
+          TF_VAR_vm_ssh_public_key:     ${{ secrets.VM_SSH_PUBLIC_KEY }}     # SECURITY: deploy key
           TF_VAR_allowed_rdp_source_ip: ${{ secrets.ALLOWED_RDP_IP }}
           TF_VAR_allowed_ssh_source_ip: ${{ secrets.ALLOWED_SSH_IP }}
-          TF_VAR_key_vault_name:     ${{ secrets.KEY_VAULT_NAME }}
+          TF_VAR_key_vault_name:        ${{ secrets.KEY_VAULT_NAME }}
+          TF_VAR_setup_script_url:      ${{ steps.upload_script.outputs.sas_url }}  # SECURITY: SAS token
         run: terraform plan -out=tfplan
 
       - name: Terraform apply
         working-directory: ${{ env.TF_WORKING_DIR }}
         env:
-          TF_VAR_subscription_id:    ${{ secrets.TF_VAR_subscription_id }}
-          TF_VAR_tenant_id:          ${{ secrets.TF_VAR_tenant_id }}
-          TF_VAR_vm_admin_password:  ${{ secrets.VM_ADMIN_PASSWORD }}
-          TF_VAR_mysql_root_password: ${{ secrets.MYSQL_ROOT_PASSWORD }}
-          TF_VAR_db_password:        ${{ secrets.DB_PASSWORD }}
-          TF_VAR_vm_ssh_public_key:  ${{ secrets.VM_SSH_PUBLIC_KEY }}
+          TF_VAR_subscription_id:       ${{ secrets.TF_VAR_subscription_id }}
+          TF_VAR_tenant_id:             ${{ secrets.TF_VAR_tenant_id }}
+          TF_VAR_vm_admin_password:     ${{ secrets.VM_ADMIN_PASSWORD }}
+          TF_VAR_mysql_root_password:   ${{ secrets.MYSQL_ROOT_PASSWORD }}
+          TF_VAR_db_password:           ${{ secrets.DB_PASSWORD }}
+          TF_VAR_vm_ssh_public_key:     ${{ secrets.VM_SSH_PUBLIC_KEY }}
           TF_VAR_allowed_rdp_source_ip: ${{ secrets.ALLOWED_RDP_IP }}
           TF_VAR_allowed_ssh_source_ip: ${{ secrets.ALLOWED_SSH_IP }}
-          TF_VAR_key_vault_name:     ${{ secrets.KEY_VAULT_NAME }}
+          TF_VAR_key_vault_name:        ${{ secrets.KEY_VAULT_NAME }}
+          TF_VAR_setup_script_url:      ${{ steps.upload_script.outputs.sas_url }}  # SECURITY: SAS token
         run: terraform apply -auto-approve tfplan
 
       - name: Capture Terraform outputs
