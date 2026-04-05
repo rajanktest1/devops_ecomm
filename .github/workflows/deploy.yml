@@ -1,0 +1,278 @@
+# =============================================================================
+# deploy.yml — GitHub Actions CI/CD pipeline for ecomm
+#
+# REQUIRED GITHUB SECRETS (Settings → Secrets and variables → Actions):
+#   AZURE_CLIENT_ID        — App Registration client ID (OIDC federated credential)
+#   AZURE_TENANT_ID        — Azure AD tenant ID
+#   AZURE_SUBSCRIPTION_ID  — Azure subscription ID
+#   TF_BACKEND_SA          — Terraform state storage account name (e.g. tfstatesa)
+#   VM_SSH_PRIVATE_KEY     — Private key matching vm-ssh-public-key in Key Vault
+#   ALLOWED_RDP_IP         — Your public IP/CIDR for NSG RDP rule (e.g. 203.0.113.10/32)
+#   ALLOWED_SSH_IP         — Your public IP/CIDR for NSG SSH rule
+#   MYSQL_ROOT_PASSWORD    — MySQL root password (pushed to Key Vault)
+#   DB_PASSWORD            — App MySQL user password (pushed to Key Vault)
+#   VM_ADMIN_PASSWORD      — Windows VM administrator password
+#   VM_SSH_PUBLIC_KEY      — SSH public key content (pushed to Key Vault)
+#   KEY_VAULT_NAME         — Name of the Azure Key Vault (must match tfvars)
+#   TF_VAR_subscription_id — Azure subscription ID (Terraform var)
+#   TF_VAR_tenant_id       — Azure tenant ID (Terraform var)
+# =============================================================================
+
+name: Deploy ecomm to Azure
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# SECURITY: Use minimal permissions; id-token write is required for OIDC auth
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  # OIDC auth — no long-lived credentials needed
+  # SECURITY: these map GitHub Secrets to the env vars the AzureRM provider reads
+  ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID }}       # SECURITY: OIDC client identity
+  ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}       # SECURITY: AAD tenant
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }} # SECURITY: subscription scope
+  ARM_USE_OIDC:        "true"
+
+  TF_WORKING_DIR: infra
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. BUILD
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: |
+            frontend/package-lock.json
+            backend/package-lock.json
+
+      - name: Install and build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Upload frontend dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+          retention-days: 1
+
+      - name: Upload backend artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-src
+          path: |
+            backend/
+            !backend/node_modules/
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # 2. TEST
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # TODO: replace this placeholder with real test commands once vitest/jest is set up
+      # Suggested: cd frontend && npm run test (vitest) | cd backend && npm test (jest)
+      - name: Placeholder — no tests yet
+        run: echo "No tests yet — add vitest/jest here"
+
+  # ---------------------------------------------------------------------------
+  # 3. INFRA (main branch only)
+  # ---------------------------------------------------------------------------
+  infra:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    outputs:
+      vm_public_ip:    ${{ steps.tf_outputs.outputs.vm_public_ip }}
+      key_vault_name:  ${{ steps.tf_outputs.outputs.key_vault_name }}
+      resource_group:  ${{ steps.tf_outputs.outputs.resource_group_name }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}       # SECURITY: OIDC app identity
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}       # SECURITY: AAD tenant
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }} # SECURITY: subscription scope
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.8.0"
+          terraform_wrapper: true
+
+      - name: Terraform init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="storage_account_name=${{ secrets.TF_BACKEND_SA }}" \
+            -backend-config="resource_group_name=rg-tfstate" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=ecomm.terraform.tfstate"
+
+      - name: Terraform plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        env:
+          # SECURITY: sensitive Terraform variables injected from GitHub Secrets, never logged
+          TF_VAR_subscription_id:    ${{ secrets.TF_VAR_subscription_id }}
+          TF_VAR_tenant_id:          ${{ secrets.TF_VAR_tenant_id }}
+          TF_VAR_vm_admin_password:  ${{ secrets.VM_ADMIN_PASSWORD }}   # SECURITY: VM credential
+          TF_VAR_mysql_root_password: ${{ secrets.MYSQL_ROOT_PASSWORD }} # SECURITY: DB root credential
+          TF_VAR_db_password:        ${{ secrets.DB_PASSWORD }}          # SECURITY: app DB credential
+          TF_VAR_vm_ssh_public_key:  ${{ secrets.VM_SSH_PUBLIC_KEY }}    # SECURITY: deploy key
+          TF_VAR_allowed_rdp_source_ip: ${{ secrets.ALLOWED_RDP_IP }}
+          TF_VAR_allowed_ssh_source_ip: ${{ secrets.ALLOWED_SSH_IP }}
+          TF_VAR_key_vault_name:     ${{ secrets.KEY_VAULT_NAME }}
+        run: terraform plan -out=tfplan
+
+      - name: Terraform apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        env:
+          TF_VAR_subscription_id:    ${{ secrets.TF_VAR_subscription_id }}
+          TF_VAR_tenant_id:          ${{ secrets.TF_VAR_tenant_id }}
+          TF_VAR_vm_admin_password:  ${{ secrets.VM_ADMIN_PASSWORD }}
+          TF_VAR_mysql_root_password: ${{ secrets.MYSQL_ROOT_PASSWORD }}
+          TF_VAR_db_password:        ${{ secrets.DB_PASSWORD }}
+          TF_VAR_vm_ssh_public_key:  ${{ secrets.VM_SSH_PUBLIC_KEY }}
+          TF_VAR_allowed_rdp_source_ip: ${{ secrets.ALLOWED_RDP_IP }}
+          TF_VAR_allowed_ssh_source_ip: ${{ secrets.ALLOWED_SSH_IP }}
+          TF_VAR_key_vault_name:     ${{ secrets.KEY_VAULT_NAME }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: Capture Terraform outputs
+        id: tf_outputs
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          echo "vm_public_ip=$(terraform output -raw vm_public_ip)" >> "$GITHUB_OUTPUT"
+          echo "key_vault_name=$(terraform output -raw key_vault_name)" >> "$GITHUB_OUTPUT"
+          echo "resource_group_name=$(terraform output -raw resource_group_name)" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # 4. KEYVAULT-SECRETS
+  # Push runtime secrets from GitHub Secrets into Key Vault.
+  # The VM reads these at runtime via IMDS — never passed as env vars to VM.
+  # ---------------------------------------------------------------------------
+  keyvault-secrets:
+    name: Push Secrets to Key Vault
+    runs-on: ubuntu-latest
+    needs: infra
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Push mysql-root-password to Key Vault
+        run: |
+          az keyvault secret set \
+            --vault-name "${{ secrets.KEY_VAULT_NAME }}" \
+            --name "mysql-root-password" \
+            --value "${{ secrets.MYSQL_ROOT_PASSWORD }}"  # SECURITY: MySQL root credential
+        env:
+          AZURE_CORE_OUTPUT: none # suppress az output that might echo secret names
+
+      - name: Push db-password to Key Vault
+        run: |
+          az keyvault secret set \
+            --vault-name "${{ secrets.KEY_VAULT_NAME }}" \
+            --name "db-password" \
+            --value "${{ secrets.DB_PASSWORD }}"  # SECURITY: app-level DB credential
+
+      - name: Push vm-admin-password to Key Vault
+        run: |
+          az keyvault secret set \
+            --vault-name "${{ secrets.KEY_VAULT_NAME }}" \
+            --name "vm-admin-password" \
+            --value "${{ secrets.VM_ADMIN_PASSWORD }}"  # SECURITY: Windows admin credential
+
+      - name: Push vm-ssh-public-key to Key Vault
+        run: |
+          az keyvault secret set \
+            --vault-name "${{ secrets.KEY_VAULT_NAME }}" \
+            --name "vm-ssh-public-key" \
+            --value "${{ secrets.VM_SSH_PUBLIC_KEY }}"  # SECURITY: deploy SSH public key
+
+  # ---------------------------------------------------------------------------
+  # 5. DEPLOY — copy files and run deploy-app.ps1 on the VM
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy App
+    runs-on: ubuntu-latest
+    needs: keyvault-secrets
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+
+      - name: Download backend source
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-src
+          path: backend/
+
+      - name: Set up SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.VM_SSH_PRIVATE_KEY }} # SECURITY: deploy private key
+
+      - name: Add VM host to known_hosts
+        run: |
+          VM_IP="${{ needs.infra.outputs.vm_public_ip }}"
+          ssh-keyscan -H "$VM_IP" >> ~/.ssh/known_hosts
+
+      - name: Copy frontend dist to VM
+        run: |
+          VM_IP="${{ needs.infra.outputs.vm_public_ip }}"
+          scp -r frontend/dist/ "${{ vars.VM_ADMIN_USERNAME || 'ecommadmin' }}@${VM_IP}:C:/deploy/frontend-dist/"
+
+      - name: Copy backend to VM (exclude node_modules)
+        run: |
+          VM_IP="${{ needs.infra.outputs.vm_public_ip }}"
+          rsync -avz --exclude='node_modules' backend/ \
+            "${{ vars.VM_ADMIN_USERNAME || 'ecommadmin' }}@${VM_IP}:C:/deploy/backend/"
+
+      - name: Run deploy-app.ps1 on VM
+        run: |
+          VM_IP="${{ needs.infra.outputs.vm_public_ip }}"
+          ssh "${{ vars.VM_ADMIN_USERNAME || 'ecommadmin' }}@${VM_IP}" \
+            "powershell -ExecutionPolicy Bypass -File C:/deploy/scripts/deploy-app.ps1"

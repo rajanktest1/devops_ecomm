@@ -1,0 +1,99 @@
+# =============================================================================
+# variables.tf — input variables for the ecomm Azure infrastructure
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Azure identity
+# -----------------------------------------------------------------------------
+variable "subscription_id" {
+  type        = string
+  description = "Azure subscription ID."
+}
+
+variable "tenant_id" {
+  type        = string
+  description = "Azure Active Directory tenant ID."
+}
+
+# -----------------------------------------------------------------------------
+# Resource placement
+# -----------------------------------------------------------------------------
+variable "resource_group_name" {
+  type        = string
+  description = "Name of the Azure resource group to create."
+  default     = "rg-ecomm"
+}
+
+variable "location" {
+  type        = string
+  description = "Azure region for all resources (e.g. eastus, westeurope)."
+  default     = "eastus"
+}
+
+variable "environment" {
+  type        = string
+  description = "Environment label applied to resource tags (dev / staging / prod)."
+  default     = "dev"
+}
+
+# -----------------------------------------------------------------------------
+# Key Vault
+# -----------------------------------------------------------------------------
+variable "key_vault_name" {
+  type        = string
+  description = "Globally unique name for the Azure Key Vault (3-24 chars, alphanumeric + hyphens)."
+}
+
+# -----------------------------------------------------------------------------
+# Virtual Machine
+# -----------------------------------------------------------------------------
+variable "vm_size" {
+  type        = string
+  description = "Azure VM SKU for the Windows Server 2022 VM."
+  default     = "Standard_B2s"
+}
+
+variable "vm_admin_username" {
+  type        = string
+  description = "Administrator username for the Windows VM (used for RDP)."
+  default     = "ecommadmin"
+}
+
+variable "vm_admin_password" {
+  type        = string
+  description = "Administrator password for the Windows VM."
+  sensitive   = true # SECURITY: never shown in plan/apply output
+}
+
+variable "vm_ssh_public_key" {
+  type        = string
+  description = "Ed25519 or RSA SSH public key content for the deploy user account (e.g. 'ssh-ed25519 AAAA...')."
+}
+
+# -----------------------------------------------------------------------------
+# Networking
+# -----------------------------------------------------------------------------
+variable "allowed_rdp_source_ip" {
+  type        = string
+  description = "Your public IP address (CIDR) allowed to RDP into the VM, e.g. '203.0.113.10/32'."
+}
+
+variable "allowed_ssh_source_ip" {
+  type        = string
+  description = "Your public IP address (CIDR) allowed to SSH into the VM for deployments, e.g. '203.0.113.10/32'. Can be the same as allowed_rdp_source_ip."
+}
+
+# -----------------------------------------------------------------------------
+# Database secrets
+# -----------------------------------------------------------------------------
+variable "mysql_root_password" {
+  type        = string
+  description = "MySQL root user password. Stored in Key Vault; never logged."
+  sensitive   = true # SECURITY: never shown in plan/apply output
+}
+
+variable "db_password" {
+  type        = string
+  description = "Password for the dedicated ecomm app MySQL user (ecommapp). Stored in Key Vault."
+  sensitive   = true # SECURITY: never shown in plan/apply output
+}
