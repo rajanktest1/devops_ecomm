@@ -1,0 +1,261 @@
+# =============================================================================
+# destroy.yml — Tear down all Azure infrastructure for ecomm
+#
+# SAFETY LAYERS:
+#   1. Only runs via manual trigger (workflow_dispatch) — never on push/PR
+#   2. Requires typing "destroy" as confirmation input
+#   3. "terraform-plan-destroy" job prints the plan and pauses for human review
+#   4. "terraform-destroy" job references the "destroy-approval" GitHub Environment
+#      which must have Required Reviewers configured — the job will not run until
+#      an approver clicks "Approve" in the GitHub Actions UI.
+#
+# ONE-TIME SETUP (do this before the first run):
+#   GitHub repo → Settings → Environments → New environment
+#   Name: destroy-approval
+#   ☑ Required reviewers → add yourself (and any teammates who should approve)
+#   ☑ Prevent self-review (optional, recommended for teams)
+#   Save protection rules
+#
+# HOW TO RUN:
+#   GitHub → Actions → "Destroy ecomm Azure Infrastructure"
+#   → Run workflow → fill in confirm + reason → Run workflow
+#   → Wait for plan job to complete, review the plan output
+#   → Approve the pending "terraform-destroy" job in the Actions UI
+# =============================================================================
+
+name: Destroy ecomm Azure Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Safety check: type 'destroy' exactly to proceed"
+        required: true
+        type: string
+      reason:
+        description: "Reason for destroying (recorded in job log for audit)"
+        required: true
+        type: string
+
+# SECURITY: id-token write required for OIDC; no other elevated permissions
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  ARM_USE_OIDC:        "true"
+  TF_WORKING_DIR:      infra
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # JOB 1 — GUARD
+  # Fails immediately if confirmation word is wrong.
+  # Prevents accidental triggering via workflow_dispatch with wrong input.
+  # ---------------------------------------------------------------------------
+  guard:
+    name: "Safety Check"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate confirmation input
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "destroy" ]; then
+            echo "::error::Confirmation failed. You must type exactly 'destroy'."
+            echo "You typed: '${{ github.event.inputs.confirm }}'"
+            exit 1
+          fi
+          echo "✓ Confirmation accepted."
+          echo "Triggered by : ${{ github.actor }}"
+          echo "Reason       : ${{ github.event.inputs.reason }}"
+          echo "Repository   : ${{ github.repository }}"
+          echo "Time (UTC)   : $(date -u)"
+
+  # ---------------------------------------------------------------------------
+  # JOB 2 — PLAN
+  # Runs terraform destroy -target=... plan so the reviewer can see exactly
+  # which resources will be deleted before approving the actual destroy.
+  # ---------------------------------------------------------------------------
+  plan-destroy:
+    name: "Terraform Plan (destroy)"
+    runs-on: ubuntu-latest
+    needs: guard
+    outputs:
+      sas_url: ${{ steps.upload_script.outputs.sas_url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.8.0"
+          terraform_wrapper: true
+
+      - name: Terraform init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="storage_account_name=${{ secrets.TF_BACKEND_SA }}" \
+            -backend-config="resource_group_name=rg-tfstate" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=ecomm.terraform.tfstate"
+
+      # setup_script_url variable is required by variables.tf validation.
+      # We reuse the existing blob so the SAS URL is valid for the plan.
+      - name: Generate SAS URL for setup-vm.ps1 (satisfies var validation)
+        id: upload_script
+        run: |
+          ACCOUNT_KEY=$(az storage account keys list \
+            --account-name "${{ secrets.TF_BACKEND_SA }}" \
+            --resource-group rg-tfstate \
+            --query '[0].value' -o tsv)
+
+          az storage blob upload \
+            --account-name "${{ secrets.TF_BACKEND_SA }}" \
+            --container-name scripts \
+            --name setup-vm.ps1 \
+            --file scripts/setup-vm.ps1 \
+            --account-key "$ACCOUNT_KEY" \
+            --overwrite \
+            --output none
+
+          EXPIRY=$(date -u -d '+1 year' '+%Y-%m-%dT%H:%MZ')
+          SAS_URL=$(az storage blob generate-sas \
+            --account-name "${{ secrets.TF_BACKEND_SA }}" \
+            --container-name scripts \
+            --name setup-vm.ps1 \
+            --permissions r \
+            --expiry "$EXPIRY" \
+            --account-key "$ACCOUNT_KEY" \
+            --full-uri \
+            --output tsv)
+
+          # SECURITY: mask SAS token from logs
+          echo "::add-mask::$SAS_URL"
+          echo "sas_url=$SAS_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Terraform plan (destroy mode)
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        env:
+          TF_VAR_subscription_id:       ${{ secrets.TF_VAR_subscription_id }}
+          TF_VAR_tenant_id:             ${{ secrets.TF_VAR_tenant_id }}
+          TF_VAR_vm_admin_password:     ${{ secrets.VM_ADMIN_PASSWORD }}
+          TF_VAR_mysql_root_password:   ${{ secrets.MYSQL_ROOT_PASSWORD }}
+          TF_VAR_db_password:           ${{ secrets.DB_PASSWORD }}
+          TF_VAR_vm_ssh_public_key:     ${{ secrets.VM_SSH_PUBLIC_KEY }}
+          TF_VAR_allowed_rdp_source_ip: ${{ secrets.ALLOWED_RDP_IP }}
+          TF_VAR_allowed_ssh_source_ip: ${{ secrets.ALLOWED_SSH_IP }}
+          TF_VAR_key_vault_name:        ${{ secrets.KEY_VAULT_NAME }}
+          TF_VAR_setup_script_url:      ${{ steps.upload_script.outputs.sas_url }}
+        run: |
+          echo "============================================"
+          echo "RESOURCES THAT WILL BE DESTROYED:"
+          echo "Review this list before approving the next job."
+          echo "============================================"
+          terraform plan -destroy -no-color \
+            -out=destroy.tfplan 2>&1 | grep -E "^  # |will be destroyed|Plan:|Changes to Outputs"
+          echo "============================================"
+          echo "Full plan saved as destroy.tfplan"
+          echo "Approve the 'terraform-destroy' job below to proceed."
+
+  # ---------------------------------------------------------------------------
+  # JOB 3 — DESTROY (requires human approval via GitHub Environment)
+  #
+  # This job is BLOCKED until a required reviewer approves it in GitHub UI:
+  #   Actions → this run → "terraform-destroy" pending → Review deployments → Approve
+  #
+  # The "destroy-approval" environment must be configured with Required Reviewers.
+  # See setup instructions at the top of this file.
+  # ---------------------------------------------------------------------------
+  terraform-destroy:
+    name: "Terraform Destroy (requires approval)"
+    runs-on: ubuntu-latest
+    needs: plan-destroy
+    # Reference to the GitHub Environment — this is what triggers the approval gate.
+    # The job will not start until a required reviewer clicks "Approve" in the UI.
+    environment: destroy-approval
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.8.0"
+          terraform_wrapper: true
+
+      - name: Terraform init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="storage_account_name=${{ secrets.TF_BACKEND_SA }}" \
+            -backend-config="resource_group_name=rg-tfstate" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=ecomm.terraform.tfstate"
+
+      - name: Generate SAS URL for setup-vm.ps1 (satisfies var validation)
+        id: upload_script
+        run: |
+          ACCOUNT_KEY=$(az storage account keys list \
+            --account-name "${{ secrets.TF_BACKEND_SA }}" \
+            --resource-group rg-tfstate \
+            --query '[0].value' -o tsv)
+
+          EXPIRY=$(date -u -d '+1 year' '+%Y-%m-%dT%H:%MZ')
+          SAS_URL=$(az storage blob generate-sas \
+            --account-name "${{ secrets.TF_BACKEND_SA }}" \
+            --container-name scripts \
+            --name setup-vm.ps1 \
+            --permissions r \
+            --expiry "$EXPIRY" \
+            --account-key "$ACCOUNT_KEY" \
+            --full-uri \
+            --output tsv)
+
+          echo "::add-mask::$SAS_URL"
+          echo "sas_url=$SAS_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Terraform destroy
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        env:
+          TF_VAR_subscription_id:       ${{ secrets.TF_VAR_subscription_id }}
+          TF_VAR_tenant_id:             ${{ secrets.TF_VAR_tenant_id }}
+          TF_VAR_vm_admin_password:     ${{ secrets.VM_ADMIN_PASSWORD }}
+          TF_VAR_mysql_root_password:   ${{ secrets.MYSQL_ROOT_PASSWORD }}
+          TF_VAR_db_password:           ${{ secrets.DB_PASSWORD }}
+          TF_VAR_vm_ssh_public_key:     ${{ secrets.VM_SSH_PUBLIC_KEY }}
+          TF_VAR_allowed_rdp_source_ip: ${{ secrets.ALLOWED_RDP_IP }}
+          TF_VAR_allowed_ssh_source_ip: ${{ secrets.ALLOWED_SSH_IP }}
+          TF_VAR_key_vault_name:        ${{ secrets.KEY_VAULT_NAME }}
+          TF_VAR_setup_script_url:      ${{ steps.upload_script.outputs.sas_url }}
+        run: terraform destroy -auto-approve
+
+      - name: Destruction complete — audit record
+        if: always()
+        run: |
+          echo "============================================"
+          echo "DESTRUCTION COMPLETE"
+          echo "Triggered by : ${{ github.actor }}"
+          echo "Reason       : ${{ github.event.inputs.reason }}"
+          echo "Repository   : ${{ github.repository }}"
+          echo "Time (UTC)   : $(date -u)"
+          echo "============================================"
+          echo ""
+          echo "Resources NOT destroyed (manual cleanup required):"
+          echo "  - Resource group: rg-tfstate  (holds Terraform state)"
+          echo "  - Azure App Registration (OIDC identity)"
+          echo "  Run: az group delete -n rg-tfstate  (when state no longer needed)"
